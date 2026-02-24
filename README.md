@@ -1,4 +1,4 @@
-# MusclePose
+# MusclePose Attempted integrated with the LLM
 
 Physics-informed neural network that estimates 47-DoF joint kinematics, inverse-dynamics torques, and Hill-type muscle torques from 2D COCO keypoints — then injects all of that into an LLM for coaching feedback.
 
