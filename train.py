@@ -2,44 +2,38 @@
 Unified MusclePose + LLM Training
 
 End-to-end pipeline:
-  COCO 2D keypoints -> MusclePose (physics) -> PhysicsBridge -> LLM coaching
+  Clip JSON -> ClipDataset -> 7-ch trajectory waves (C,T)
+    -> transpose to (T,C) tokens -> MusclePose (physics) -> PhysicsBridge -> LLM coaching
+
+Each JSON clip contains:
+  trajectory, legs_trajectory, shoulder_trajectory, back_trajectory,
+  knee_angle_trajectory, arm_Trajectory, core_            (7 x N_FRAMES floats)
+  wave_features   (quality, energy, damping, frequency, harmonic, waves)
+  LANGUAGE         (ground-truth coaching text)
+  exercise, expert, fps, n_frames, error_rate, video_id   (metadata)
 
 Combined loss:
   L = L_physics + w_lm * L_lm
 
-  L_physics = reproj + torque_consistency + smoothness + joint_limits + activation_sparsity
-  L_lm      = causal language modelling on coaching text
+  L_physics = torque_consistency + smoothness + joint_limits + activation_sparsity
+  L_lm      = causal language modelling on coaching text (LANGUAGE field)
 """
 
 import argparse
 import os
 import time
-import json
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split, Dataset
+from torch.utils.data import DataLoader, random_split
 
-from MusclePose.data.tokens import make_tokens_from_coco
+from MusclePose.data.loader import ClipDataset, TRAJECTORY_KEYS
 from MusclePose.models.musclepose import MusclePoseCOCO, PhysicsBridge, ForwardOut
-from MusclePose.physics.skeleton47 import default_skeleton47, forward_kinematics
+from MusclePose.wave_llm.bridge import extract_physics_summary, build_llm_prompt
+from MusclePose.physics.skeleton47 import default_skeleton47
 
-SKEL_TO_COCO = {
-    0:  (11, 12),
-    3:  (0,),
-    5:  (5,),
-    6:  (7,),
-    7:  (9,),
-    9:  (6,),
-    10: (8,),
-    11: (10,),
-    12: (11,),
-    13: (13,),
-    14: (15,),
-    15: (12,),
-    16: (14,),
-    17: (16,),
-}
+
+N_CHANNELS = len(TRAJECTORY_KEYS)   # 7 trajectory signals
 
 
 def parse_args():
@@ -49,7 +43,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--lr_lm", type=float, default=2e-4)
-    p.add_argument("--seq_len", type=int, default=60)
+    p.add_argument("--seq_len", type=int, default=300)
     p.add_argument("--dt", type=float, default=1/30)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--save_dir", type=str, default="checkpoints")
@@ -66,92 +60,15 @@ def parse_args():
     p.add_argument("--max_text_len", type=int, default=256)
 
     # loss weights
-    p.add_argument("--w_reproj",  type=float, default=10.0)
-    p.add_argument("--w_torque",  type=float, default=1.0)
-    p.add_argument("--w_smooth",  type=float, default=0.1)
-    p.add_argument("--w_jlim",   type=float, default=0.05)
-    p.add_argument("--w_act",    type=float, default=0.01)
-    p.add_argument("--w_lm",     type=float, default=1.0)
+    p.add_argument("--w_torque", type=float, default=1.0)
+    p.add_argument("--w_smooth", type=float, default=0.1)
+    p.add_argument("--w_jlim",  type=float, default=0.05)
+    p.add_argument("--w_act",   type=float, default=0.01)
+    p.add_argument("--w_lm",    type=float, default=1.0)
     return p.parse_args()
 
 
-# ── Dataset ─────────────────────────────────────────────────────────────
-class PairedDataset(Dataset):
-    """
-    Loads .pt files containing:
-      kxy:           (T, 17, 2)
-      kconf:         (T, 17)
-      coaching_text: str  (optional, for LLM supervision)
-    """
-    def __init__(self, data_dir, seq_len=60):
-        self.seq_len = seq_len
-        self.samples = []
-        for fn in sorted(os.listdir(data_dir)):
-            if not fn.endswith(".pt"):
-                continue
-            d = torch.load(os.path.join(data_dir, fn), map_location="cpu", weights_only=True)
-            kxy = d["kxy"]
-            kconf = d["kconf"]
-            text = d.get("coaching_text", "")
-            T = kxy.shape[0]
-            for start in range(0, T - seq_len + 1, seq_len // 2):
-                self.samples.append((
-                    kxy[start:start+seq_len],
-                    kconf[start:start+seq_len],
-                    text,
-                ))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-
-class SyntheticPairedDataset(Dataset):
-    """Generates random COCO keypoints + dummy coaching text for demo runs."""
-    def __init__(self, n_samples=64, seq_len=60):
-        self.n = n_samples
-        self.seq_len = seq_len
-        self.texts = [
-            "Good form. Keep your back straight and maintain consistent tempo.",
-            "Watch your knees tracking over toes. Slow down the eccentric phase.",
-            "Excellent depth. Try engaging your core more at the bottom.",
-        ]
-
-    def __len__(self):
-        return self.n
-
-    def __getitem__(self, idx):
-        kxy = torch.randn(self.seq_len, 17, 2) * 100 + 300
-        kconf = torch.ones(self.seq_len, 17)
-        text = self.texts[idx % len(self.texts)]
-        return kxy, kconf, text
-
-
 # ── Losses ──────────────────────────────────────────────────────────────
-def reprojection_loss(q, kxy_gt, kconf, skel):
-    B, T, _ = q.shape
-    q_flat = q.reshape(B * T, 47)
-    _, p_joint, _ = forward_kinematics(q_flat, skel)
-    p_joint = p_joint.reshape(B, T, 18, 3)
-    proj_2d = p_joint[..., :2]
-    loss = torch.tensor(0.0, device=q.device)
-    n = 0
-    for skel_idx, coco_ids in SKEL_TO_COCO.items():
-        skel_pt = proj_2d[:, :, skel_idx]
-        if len(coco_ids) == 2:
-            target = 0.5 * (kxy_gt[:, :, coco_ids[0]] + kxy_gt[:, :, coco_ids[1]])
-            conf = torch.min(kconf[:, :, coco_ids[0]], kconf[:, :, coco_ids[1]])
-        else:
-            target = kxy_gt[:, :, coco_ids[0]]
-            conf = kconf[:, :, coco_ids[0]]
-        diff = (skel_pt - target).pow(2).sum(dim=-1)
-        loss = loss + (conf * diff).mean()
-        n += 1
-    return loss / max(n, 1)
-
-
 def torque_loss(out: ForwardOut):
     return (out.tau_q[..., 6:] - out.tau_mtg).pow(2).mean()
 
@@ -198,45 +115,37 @@ def load_llm_with_lora(model_name, lora_r, lora_alpha, device):
     return llm, tokenizer
 
 
-def build_coaching_prompt(out: ForwardOut) -> str:
-    """Build a text prompt from physics outputs (no clip JSON needed)."""
-    q_range = out.q.detach().abs().mean().item()
-    tau_mean = out.tau_q.detach().abs().mean().item()
-    tau_mtg_mean = out.tau_mtg.detach().abs().mean().item()
-    residual = (out.tau_q[..., 6:] - out.tau_mtg).detach().abs().mean().item()
-    contact_pct = out.contact.detach().mean().item() * 100
-
-    lines = [
-        f"Joint angle range: {q_range:.3f} rad",
-        f"ID torque mean: {tau_mean:.1f} Nm",
-        f"MTG torque mean: {tau_mtg_mean:.1f} Nm",
-        f"Torque residual: {residual:.2f} Nm",
-        f"Ground contact: {contact_pct:.0f}%",
-    ]
-    return (
-        "You are a biomechanics-aware fitness coach. "
-        "Given the physics analysis below, provide coaching feedback.\n\n"
-        + "\n".join(lines) + "\n\nCoaching feedback:"
-    )
+def build_clip_prompts(batch_wave_features, batch_exercises, batch_languages):
+    """Build per-sample LLM prompts from JSON wave_features via extract_physics_summary."""
+    prompts = []
+    for wf, ex, lang in zip(batch_wave_features, batch_exercises, batch_languages):
+        clip_dict = {"exercise": ex, "wave_features": wf}
+        summary = extract_physics_summary(clip_dict)
+        prompt = build_llm_prompt(summary, lang)
+        prompts.append(prompt)
+    return prompts
 
 
-def compute_lm_loss(llm, tokenizer, bridge, phys_out, coaching_texts, device, max_len=256):
-    """Forward through bridge + LLM, return language modelling loss."""
-    soft_tokens = bridge(phys_out)
+def compute_lm_loss(llm, tokenizer, bridge, phys_out, prompts, coaching_texts, device, max_len=256):
+    """Forward through bridge + LLM, return language modelling loss.
+
+    prompts:        list[str]  per-sample prompts built from wave_features
+    coaching_texts: list[str]  ground-truth LANGUAGE from the JSON
+    """
+    soft_tokens = bridge(phys_out)                      # (B, n_tokens, llm_dim)
     B = soft_tokens.shape[0]
 
-    prompts = ["Analyze the movement and provide coaching feedback:" for _ in range(B)]
-    prompt_enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=64).to(device)
+    prompt_enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
     target_enc = tokenizer(coaching_texts, return_tensors="pt", padding=True, truncation=True, max_length=max_len).to(device)
 
     prompt_embeds = llm.get_input_embeddings()(prompt_enc["input_ids"])
     target_embeds = llm.get_input_embeddings()(target_enc["input_ids"])
 
-    # [soft_physics_tokens, prompt_text_tokens, target_text_tokens]
+    # [soft_physics_tokens | prompt_text_tokens | target_text_tokens]
     combined_embeds = torch.cat([soft_tokens.to(prompt_embeds.dtype), prompt_embeds, target_embeds], dim=1)
     n_prefix = soft_tokens.shape[1] + prompt_embeds.shape[1]
 
-    # labels: -100 for soft+prompt tokens, actual ids for target tokens
+    # labels: -100 for soft + prompt tokens, actual ids for target tokens
     ignore = torch.full((B, n_prefix), -100, dtype=torch.long, device=device)
     labels = torch.cat([ignore, target_enc["input_ids"]], dim=1)
 
@@ -248,6 +157,23 @@ def compute_lm_loss(llm, tokenizer, bridge, phys_out, coaching_texts, device, ma
     return out.loss
 
 
+# ── Collation ───────────────────────────────────────────────────────────
+def collate_fn(batch):
+    """Collate list of ClipDataset dicts into a training batch."""
+    waves = torch.stack([b["waves"] for b in batch])            # (B, C, T)
+    masks = torch.stack([b["mask"] for b in batch])             # (B, T)
+    languages     = [b["language"] for b in batch]
+    exercises     = [b["exercise"] for b in batch]
+    wave_features = [b["wave_features"] for b in batch]
+    return {
+        "waves": waves,
+        "mask": masks,
+        "language": languages,
+        "exercise": exercises,
+        "wave_features": wave_features,
+    }
+
+
 # ── Training loop ───────────────────────────────────────────────────────
 def train_one_epoch(model, bridge, llm, tokenizer, loader, opt_phys, opt_lm, skel, args, epoch):
     model.train()
@@ -255,24 +181,30 @@ def train_one_epoch(model, bridge, llm, tokenizer, loader, opt_phys, opt_lm, ske
     device = args.device
     qmin, qmax = model.qmin, model.qmax
 
-    stats = {k: 0.0 for k in ["total", "reproj", "torque", "smooth", "jlim", "act", "lm"]}
+    stats = {k: 0.0 for k in ["total", "torque", "smooth", "jlim", "act", "lm"]}
     n = 0
 
-    for batch_idx, (kxy, kconf, texts) in enumerate(loader):
-        kxy, kconf = kxy.to(device), kconf.to(device)
-        tokens = make_tokens_from_coco(kxy, kconf)
+    for batch_idx, batch in enumerate(loader):
+        waves = batch["waves"].to(device)                       # (B, C, T)
+        tokens = waves.transpose(1, 2)                          # (B, T, C=7)
+
         out = model(tokens)
 
-        L_reproj = reprojection_loss(out.q, kxy, kconf, skel)
         L_torque = torque_loss(out)
         L_smooth = smoothness_loss(out.q)
         L_jlim   = jlim_loss(out.q, qmin, qmax)
         L_act    = activation_loss(out)
 
-        L_physics = (args.w_reproj * L_reproj + args.w_torque * L_torque
-                   + args.w_smooth * L_smooth + args.w_jlim * L_jlim + args.w_act * L_act)
+        L_physics = (args.w_torque * L_torque + args.w_smooth * L_smooth
+                   + args.w_jlim * L_jlim + args.w_act * L_act)
 
-        L_lm = compute_lm_loss(llm, tokenizer, bridge, out, list(texts), device, args.max_text_len)
+        # build per-sample prompts from wave_features (quality, energy, etc.)
+        prompts = build_clip_prompts(
+            batch["wave_features"], batch["exercise"], batch["language"]
+        )
+        coaching_texts = batch["language"]                      # LANGUAGE = ground truth
+
+        L_lm = compute_lm_loss(llm, tokenizer, bridge, out, prompts, coaching_texts, device, args.max_text_len)
         loss = L_physics + args.w_lm * L_lm
 
         opt_phys.zero_grad()
@@ -285,7 +217,6 @@ def train_one_epoch(model, bridge, llm, tokenizer, loader, opt_phys, opt_lm, ske
         opt_lm.step()
 
         stats["total"]  += loss.item()
-        stats["reproj"] += L_reproj.item()
         stats["torque"] += L_torque.item()
         stats["smooth"] += L_smooth.item()
         stats["jlim"]   += L_jlim.item()
@@ -296,10 +227,10 @@ def train_one_epoch(model, bridge, llm, tokenizer, loader, opt_phys, opt_lm, ske
         if (batch_idx + 1) % args.log_every == 0:
             avg = {k: v/n for k, v in stats.items()}
             print(f"  [{epoch}][{batch_idx+1}/{len(loader)}]  "
-                  f"loss={avg['total']:.4f}  reproj={avg['reproj']:.4f}  "
-                  f"torque={avg['torque']:.4f}  lm={avg['lm']:.4f}")
+                  f"loss={avg['total']:.4f}  torque={avg['torque']:.4f}  "
+                  f"smooth={avg['smooth']:.4f}  lm={avg['lm']:.4f}")
 
-    return {k: v/max(n,1) for k, v in stats.items()}
+    return {k: v/max(n, 1) for k, v in stats.items()}
 
 
 @torch.no_grad()
@@ -308,24 +239,22 @@ def validate(model, bridge, llm, tokenizer, loader, skel, args):
     bridge.eval()
     device = args.device
     total, n = 0.0, 0
-    for kxy, kconf, texts in loader:
-        kxy, kconf = kxy.to(device), kconf.to(device)
-        tokens = make_tokens_from_coco(kxy, kconf)
+    for batch in loader:
+        waves = batch["waves"].to(device)
+        tokens = waves.transpose(1, 2)
         out = model(tokens)
-        L_reproj = reprojection_loss(out.q, kxy, kconf, skel)
+
         L_torque = torque_loss(out)
-        L_lm = compute_lm_loss(llm, tokenizer, bridge, out, list(texts), device, args.max_text_len)
-        val = args.w_reproj * L_reproj + args.w_torque * L_torque + args.w_lm * L_lm
+
+        prompts = build_clip_prompts(
+            batch["wave_features"], batch["exercise"], batch["language"]
+        )
+        L_lm = compute_lm_loss(llm, tokenizer, bridge, out, prompts, batch["language"], device, args.max_text_len)
+
+        val = args.w_torque * L_torque + args.w_lm * L_lm
         total += val.item()
         n += 1
     return total / max(n, 1)
-
-
-def collate_fn(batch):
-    kxy = torch.stack([b[0] for b in batch])
-    kconf = torch.stack([b[1] for b in batch])
-    texts = [b[2] for b in batch]
-    return kxy, kconf, texts
 
 
 def main():
@@ -334,7 +263,7 @@ def main():
     device = torch.device(args.device)
 
     print("=" * 60)
-    print("  MusclePose Unified Training")
+    print("  MusclePose Unified Training (JSON clips)")
     print("=" * 60)
     print(f"  device:  {device}")
     print(f"  epochs:  {args.epochs}")
@@ -342,25 +271,21 @@ def main():
 
     skel = default_skeleton47(device=device)
 
-    # dataset
-    ds = PairedDataset(args.data_dir, seq_len=args.seq_len)
-    if len(ds) == 0:
-        print("  No .pt data found, using synthetic demo data")
-        ds = SyntheticPairedDataset(n_samples=64, seq_len=args.seq_len)
+    # ── dataset: reads ALL .json clips from data_dir ────────────────────
+    ds = ClipDataset(args.data_dir, sequence_length=args.seq_len)
+    print(f"  Loaded {len(ds)} clip(s) from {args.data_dir}")
 
     n_val = max(1, int(len(ds) * args.val_split))
     n_train = len(ds) - n_val
     train_ds, val_ds = random_split(ds, [n_train, n_val], generator=torch.Generator().manual_seed(42))
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     print(f"  train: {n_train}  val: {n_val}")
 
-    # model (compute D_in from actual token output)
-    dummy_kxy = torch.randn(1, args.seq_len, 17, 2)
-    dummy_kconf = torch.ones(1, args.seq_len, 17)
-    D_in = make_tokens_from_coco(dummy_kxy, dummy_kconf).shape[-1]
+    # ── model: d_in = 7 (one channel per trajectory signal) ────────────
+    D_in = N_CHANNELS
     model = MusclePoseCOCO(d_in=D_in, dt=args.dt).to(device)
-    print(f"  MusclePose params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  MusclePose params: {sum(p.numel() for p in model.parameters()):,}  (d_in={D_in})")
 
     bridge = PhysicsBridge(d_model=256, llm_dim=args.llm_dim, n_tokens=args.n_soft_tokens).to(device)
     llm, tokenizer = load_llm_with_lora(args.llm_name, args.lora_r, args.lora_alpha, device)
@@ -383,12 +308,13 @@ def main():
 
         if val_loss < best_val:
             best_val = val_loss
-            ckpt = {"model": model.state_dict(), "bridge": bridge.state_dict()}
+            ckpt = {"model": model.state_dict(), "bridge": bridge.state_dict(), "d_in": D_in}
             torch.save(ckpt, os.path.join(args.save_dir, "best.pt"))
             print(f"  -> saved best (val={best_val:.4f})")
 
         if epoch % args.save_every == 0:
-            ckpt = {"epoch": epoch, "model": model.state_dict(), "bridge": bridge.state_dict(), "val_loss": val_loss}
+            ckpt = {"epoch": epoch, "model": model.state_dict(), "bridge": bridge.state_dict(),
+                    "d_in": D_in, "val_loss": val_loss}
             torch.save(ckpt, os.path.join(args.save_dir, f"ckpt_epoch{epoch}.pt"))
 
     adapter_path = os.path.join(args.save_dir, "lora_adapter")

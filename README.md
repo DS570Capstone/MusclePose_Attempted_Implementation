@@ -5,9 +5,11 @@ Physics-informed neural network that estimates 47-DoF joint kinematics, inverse-
 ## How It Works
 
 ```
-COCO 2D keypoints (T, 17, 2)
+Clip JSON (7 trajectory signals × N frames)
         │
-   make_tokens_from_coco          normalise + velocity/accel features
+   ClipDataset                    normalise + pad/truncate → (7, T) waves
+        │
+   transpose → (T, 7)            each timestep = 7 body-region signals
         │
    MotionEncoder                  8-layer transformer (d=256)
         │
@@ -25,10 +27,13 @@ COCO 2D keypoints (T, 17, 2)
         │                         tau_q, tau_mtg, alpha, contact) + encoder
         │                         features into 8 soft tokens
         │
+   wave_features ─► PhysicsSummary ─► build_llm_prompt (quality, reps, etc.)
+        │
    LLM (Phi-3.5-mini + LoRA)     generates coaching text
+        │                         supervised by LANGUAGE field from JSON
 ```
 
-The key difference from a naive approach: **PhysicsBridge** doesn't just pass raw encoder features to the LLM. It takes the actual computed physics (torques, joint angles, muscle activations, ground contact) and projects them alongside the encoder hidden states into the LLM's embedding space. The LLM sees real biomechanics, not just motion features.
+The key difference from a naive approach: **PhysicsBridge** doesn't just pass raw encoder features to the LLM. It takes the actual computed physics (torques, joint angles, muscle activations, ground contact) and projects them alongside the encoder hidden states into the LLM's embedding space. The text prompt is built from the clip's **wave_features** (quality grade, smoothness, energy, reps, etc.) via `extract_physics_summary` + `build_llm_prompt`. The LLM sees real biomechanics + structured movement analysis, and learns to produce coaching text supervised by the **LANGUAGE** field from each JSON clip.
 
 ## Folder Layout
 
@@ -42,13 +47,13 @@ The key difference from a naive approach: **PhysicsBridge** doesn't just pass ra
 | `physics/euler_jacobian.py` | ZXY Euler angle Jacobian and its time derivative |
 | `physics/dumas_bsip.py` | Dumas body-segment inertial parameters from radii of gyration |
 | `models/musclepose.py` | `MusclePoseCOCO` (transformer + physics heads), `PhysicsBridge`, `ForwardOut` |
-| `data/tokens.py` | COCO-17 keypoint tokeniser (normalise, velocity, acceleration) |
-| `data/loader.py` | `ClipDataset` for loading clip JSON files with trajectory waves |
-| `wave_llm/bridge.py` | `PhysicsSummary` dataclass + prompt builder for clip JSONs |
+| `data/tokens.py` | COCO-17 keypoint tokeniser (legacy, used by unit tests only) |
+| `data/loader.py` | `ClipDataset` — loads clip JSON files, extracts 7-ch trajectory waves |
+| `wave_llm/bridge.py` | `PhysicsSummary` + `extract_physics_summary` + `build_llm_prompt` from clip JSON |
 | `utils/rot.py` | Rotation helpers: `euler_ZXY_to_matrix`, `skew`, `rot_x/y/z` |
 | `configs/dumas_bsip.yaml` | BSIP radii-of-gyration config |
-| `train.py` | Unified training: physics losses + LM loss in one backward pass |
-| `infer.py` | Unified inference: physics → bridge → LLM generation |
+| `train.py` | Unified training on JSON clips: physics losses + LM loss in one backward pass |
+| `infer.py` | Unified inference on a clip JSON: physics → bridge → LLM generation |
 | `tests/test_pipeline.py` | Unit tests for every module |
 
 ## Quick Start
@@ -71,35 +76,37 @@ python -m MusclePose.train \
   --save_dir MusclePose/checkpoints
 ```
 
-If no `.pt` data files are found it auto-generates synthetic data so you can verify the pipeline runs.
+Reads every `.json` clip in `--data_dir`.
 
-**Data format**: each `.pt` file should contain:
-- `kxy` — `(T, 17, 2)` COCO keypoint pixel coordinates
-- `kconf` — `(T, 17)` keypoint confidence scores
-- `coaching_text` — `str` ground-truth coaching feedback (for LM supervision)
+**Data format**: each JSON clip must contain:
+- 7 trajectory signals: `trajectory`, `legs_trajectory`, `shoulder_trajectory`, `back_trajectory`, `knee_angle_trajectory`, `arm_Trajectory`, `core_` — each a list of N floats (one per frame)
+- `wave_features` — `dict` with `quality`, `energy`, `damping`, `frequency`, `harmonic`, `waves` sub-dicts (used to build the LLM prompt)
+- `LANGUAGE` — `str` ground-truth coaching text (supervision target for LM loss)
+- `exercise` — `str` exercise type (e.g. "squat")
+- `fps`, `n_frames`, `expert`, `error_rate`, `video_id` — metadata
 
 ### Inference
 
 ```bash
 python -m MusclePose.infer \
   --checkpoint MusclePose/checkpoints/best.pt \
-  --input path/to/sample.pt \
+  --input MusclePose/data/clip_00002.json \
   --adapter_path MusclePose/checkpoints/lora_adapter
 ```
 
-Without `--input` it generates synthetic keypoints for a quick sanity check.
+Without `--input` it picks the first `.json` file found in `data/`.
 
 **What happens:**
-1. Loads COCO keypoints → runs MusclePose → prints physics (joint angles, torques, contact)
-2. PhysicsBridge encodes physics outputs into 8 soft tokens
-3. Soft tokens + text prompt are fed to the LLM
-4. LLM generates coaching feedback
+1. Reads a clip JSON → extracts 7 trajectory channels → prints clip summary (exercise, quality grade, reps, etc.)
+2. Trajectory waves → MusclePose → prints physics outputs (joint angles, torques, contact)
+3. PhysicsBridge encodes physics outputs into 8 soft tokens
+4. `wave_features` → `extract_physics_summary` → `build_llm_prompt` → structured text prompt
+5. Soft tokens + text prompt → LLM generates coaching feedback
 
 ### Training losses
 
 | Loss | Weight | What it enforces |
 |------|--------|-----------------|
-| `L_reproj` | 10.0 | FK joints match input 2D keypoints |
 | `L_torque` | 1.0 | `tau_q[6:] ≈ tau_mtg` (Newton–Euler = muscle model) |
 | `L_smooth` | 0.1 | Low jerk in joint angles |
 | `L_jlim` | 0.05 | Stay within joint limits |

@@ -176,13 +176,13 @@ def test_physics_summary_bridge():
 
 
 def test_end_to_end_unified():
-    from MusclePose.data.tokens import make_tokens_from_coco
+    """Full pipeline: JSON waves -> MusclePose -> PhysicsBridge -> soft tokens."""
     from MusclePose.models.musclepose import MusclePoseCOCO, PhysicsBridge
-    B, T = 1, 20
-    kxy = torch.randn(B, T, 17, 2) * 100 + 300
-    kconf = torch.ones(B, T, 17)
-    tokens = make_tokens_from_coco(kxy, kconf)
-    model = MusclePoseCOCO(d_in=tokens.shape[-1], dt=1/30)
+    from MusclePose.data.loader import TRAJECTORY_KEYS
+    B, T, C = 1, 30, len(TRAJECTORY_KEYS)   # 7 channels
+    waves = torch.rand(B, C, T)              # (B, C, T)  like ClipDataset output
+    tokens = waves.transpose(1, 2)           # (B, T, 7)
+    model = MusclePoseCOCO(d_in=C, dt=1/30)
     bridge = PhysicsBridge(d_model=256, llm_dim=512, n_tokens=8)
     model.eval()
     bridge.eval()
@@ -192,7 +192,44 @@ def test_end_to_end_unified():
     assert out.phi.shape == (B, T, 256)
     assert soft_tokens.shape == (B, 8, 512)
     assert out.tau_q.shape[0] == B
-    print(f"  end-to-end unified OK — physics + bridge")
+    assert out.q.shape == (B, T, 47)
+    print(f"  end-to-end unified OK — waves({C}ch) -> physics + bridge")
+
+
+def test_clip_to_model():
+    """Load the real JSON clip, run through ClipDataset -> MusclePose -> PhysicsBridge."""
+    from MusclePose.data.loader import ClipDataset, TRAJECTORY_KEYS
+    from MusclePose.models.musclepose import MusclePoseCOCO, PhysicsBridge
+    from MusclePose.wave_llm.bridge import extract_physics_summary, build_llm_prompt
+    if not os.path.exists(CLIP_PATH):
+        print("  SKIP clip_to_model (no data file)")
+        return
+    ds = ClipDataset(DATA_DIR, sequence_length=300)
+    sample = ds[0]
+    waves = sample["waves"].unsqueeze(0)         # (1, 7, 300)
+    tokens = waves.transpose(1, 2)               # (1, 300, 7)
+
+    C = len(TRAJECTORY_KEYS)
+    model = MusclePoseCOCO(d_in=C, dt=1/30)
+    bridge = PhysicsBridge(d_model=256, llm_dim=512, n_tokens=8)
+    model.eval()
+    bridge.eval()
+    with torch.no_grad():
+        out = model(tokens)
+        soft_tokens = bridge(out)
+
+    assert out.q.shape == (1, 300, 47)
+    assert soft_tokens.shape == (1, 8, 512)
+
+    # also verify wave_features -> prompt works
+    clip_dict = {"exercise": sample["exercise"], "wave_features": sample["wave_features"]}
+    summary = extract_physics_summary(clip_dict)
+    prompt = build_llm_prompt(summary, sample["language"])
+    assert "Exercise:" in prompt
+    assert "<|assistant|>" in prompt
+
+    print(f"  clip_to_model OK — {sample['video_id']}, exercise={sample['exercise']}, "
+          f"q={out.q.shape}, soft_tokens={soft_tokens.shape}")
 
 
 if __name__ == "__main__":
@@ -210,6 +247,7 @@ if __name__ == "__main__":
         test_clip_loader,
         test_physics_summary_bridge,
         test_end_to_end_unified,
+        test_clip_to_model,
     ]
     passed = 0
     failed = 0
