@@ -1,1 +1,6 @@
 __pycache__/
+*.pyc
+*.json
+*.mp4
+checkpoints/
+logs/

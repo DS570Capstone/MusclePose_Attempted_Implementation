@@ -36,7 +36,8 @@ def anthropometrics_from_beta_E(beta: torch.Tensor, E: torch.Tensor, device=None
     # E expected as (B,18) mass-ratio residuals (can be extended)
     if E.shape[-1] >= 18:
         sm = sm[None, :] + 0.02 * torch.tanh(E[:, :18])
-        sm = sm / (sm.sum(dim=-1, keepdim=True) + 1e-8)
+        sm = torch.clamp(sm, min=1e-6)
+        sm = sm / sm.sum(dim=-1, keepdim=True)
     else:
         sm = sm[None, :].repeat(B, 1)
 

@@ -1,9 +1,9 @@
 import torch
 from dataclasses import dataclass
 from torch.func import jacrev
-from ..utils.rot import skew
-from .euler_jacobian import jomega_zxy, djomega_zxy
-from .skeleton47 import forward_kinematics, default_skeleton47, unpack_q_to_local_angles
+from MusclePose.utils.rot import skew
+from MusclePose.physics.euler_jacobian import jomega_zxy, djomega_zxy
+from MusclePose.physics.skeleton47 import forward_kinematics, default_skeleton47, unpack_q_to_local_angles
 
 @dataclass
 class IDOut:
@@ -48,17 +48,50 @@ def _joint_rot_column_spans(skel):
     return spans
 
 
-def _angular_jacobians(theta_local, theta_dot_local, spans, total_dof):
-    JO = torch.zeros((len(spans), 3, total_dof), device=theta_local.device, dtype=theta_local.dtype)
+def _angular_jacobians(theta_local, theta_dot_local, R0k, skel, spans, total_dof):
+    """
+    Build angular-velocity Jacobians by accumulating through the kinematic chain.
+    Each segment inherits the angular Jacobian of its parent plus its own joint contribution.
+
+    theta_local: (18, 3)  local Euler angles per segment
+    theta_dot_local: (18, 3)  local Euler angle rates per segment
+    R0k: (18, 3, 3)  world-frame orientations per segment
+    skel: Skeleton47
+    spans: list[(start, stop)]  column ranges in q for each segment's rotational DoFs
+    total_dof: 47
+    """
+    K = len(spans)
+    device = theta_local.device
+    dtype = theta_local.dtype
+    JO = torch.zeros((K, 3, total_dof), device=device, dtype=dtype)
     dJO = torch.zeros_like(JO)
-    for k, (start, stop) in enumerate(spans):
+
+    for k in range(K):
+        start, stop = spans[k]
         width = stop - start
         if width <= 0:
             continue
-        Jw = jomega_zxy(theta_local[k])
-        dJw = djomega_zxy(theta_local[k], theta_dot_local[k])
-        JO[k, :, start:stop] = Jw[..., :width]
-        dJO[k, :, start:stop] = dJw[..., :width]
+
+        # Parent world rotation (identity for root)
+        p = skel.parent[k]
+        if p < 0:
+            R_parent = torch.eye(3, device=device, dtype=dtype)
+        else:
+            R_parent = R0k[p]  # (3, 3)
+
+        # Local Euler Jacobian and its time derivative
+        Jw = jomega_zxy(theta_local[k])                        # (3, 3)
+        dJw = djomega_zxy(theta_local[k], theta_dot_local[k])  # (3, 3)
+
+        # This joint's contribution rotated into world frame
+        JO[k, :, start:stop] = R_parent @ Jw[:, :width]
+        dJO[k, :, start:stop] = R_parent @ dJw[:, :width]
+
+        # Inherit all ancestor contributions from parent
+        if p >= 0:
+            JO[k] = JO[k] + JO[p]
+            dJO[k] = dJO[k] + dJO[p]
+
     return JO, dJO
 
 def inverse_dynamics_autograd(
@@ -93,11 +126,14 @@ def inverse_dynamics_autograd(
             qq = q[b, t]
             Jpos = Jpos_fn(qq)  # (18,3,47)
             JV = Jpos           # (18,3,47)
+
+            # FK for R0k — needed for both inertia rotation and angular Jacobians
+            R0k, _, _ = forward_kinematics(qq[None, :], skel)
+            R0k = R0k[0]  # (18,3,3)
+
             theta_local = all_angles[b, t]
             theta_dot_local = all_angle_rates[b, t]
-            JO, dJO = _angular_jacobians(theta_local, theta_dot_local, spans, N)
-
-            # time derivatives of J: finite diff in time (simple)
+            JO, dJO = _angular_jacobians(theta_local, theta_dot_local, R0k, skel, spans, N)
             if 0 < t < T-1:
                 Jpos_prev = Jpos_fn(q[b, t-1])
                 Jpos_next = Jpos_fn(q[b, t+1])
@@ -106,10 +142,6 @@ def inverse_dynamics_autograd(
                 dJV = (Jpos_fn(q[b, t+1]) - Jpos) 
             else:
                 dJV = (Jpos - Jpos_fn(q[b, t-1]))
-
-            # FK for R0k to rotate inertia
-            R0k, _, _ = forward_kinematics(qq[None, :], skel)
-            R0k = R0k[0]  # (18,3,3)
 
             Mk_sp = _spatial_inertia(mk[b:b+1], I0k[b:b+1], R0k[None, ...])[0]  # (18,6,6)
 
@@ -134,7 +166,14 @@ def inverse_dynamics_autograd(
                     wrench = foot_wrenches[b,t,fi]                        # (6,)
                     Fext = Fext + (Jfoot.transpose(0,1) @ wrench[:,None]).squeeze(-1)
 
-            tau = (Mmat @ qddot[b,t][:,None]).squeeze(-1) + Cvec - Fext
+            # Gravity generalized force: Q_grav = sum_k mk * JV_k^T @ g
+            g_vec = torch.tensor([0.0, -9.81, 0.0], device=q.device, dtype=q.dtype)
+            Grav = torch.zeros((N,), device=q.device, dtype=q.dtype)
+            for seg_k in range(K):
+                Grav = Grav + mk[b, seg_k] * (JV[seg_k].T @ g_vec)
+
+            # tau = M*qddot + C - Q_grav - Q_ext
+            tau = (Mmat @ qddot[b,t][:,None]).squeeze(-1) + Cvec - Grav - Fext
 
             tau_out[b,t] = tau
             M_out[b,t] = Mmat
@@ -142,13 +181,3 @@ def inverse_dynamics_autograd(
             Fext_out[b,t] = Fext
 
     return IDOut(tau_q=tau_out, M=M_out, C=C_out, Fext=Fext_out)
-def jomega_hinge(axis_local: torch.Tensor) -> torch.Tensor:
-    # axis_local: (...,3) unit axis in joint local frame (parent frame)
-    # returns (...,3,1)
-    return axis_local[..., :, None]
-
-def djomega_hinge(axis_local: torch.Tensor, axis_dot_local=None) -> torch.Tensor:
-    # typically 0 if axis fixed in parent frame
-    if axis_dot_local is None:
-        return torch.zeros((*axis_local.shape[:-1], 3, 1), device=axis_local.device, dtype=axis_local.dtype)
-    return axis_dot_local[..., :, None]

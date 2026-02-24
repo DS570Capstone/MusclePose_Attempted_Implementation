@@ -51,12 +51,11 @@ def inertia_from_bsip(mk: torch.Tensor, Lk: torch.Tensor, bsip: SegmentBSIP) -> 
     I[..., 1, 1] = Iyy
     I[..., 2, 2] = Izz
 
-    # If products of inertia exist, fill them (sign conventions must match your SCS definition)
     if bsip.poi is not None:
         kxy, kxz, kyz = bsip.poi
-        Ixy = mk * (kxy * Lk) ** 2
-        Ixz = mk * (kxz * Lk) ** 2
-        Iyz = mk * (kyz * Lk) ** 2
+        Ixy = mk * kxy * Lk ** 2
+        Ixz = mk * kxz * Lk ** 2
+        Iyz = mk * kyz * Lk ** 2
         I[..., 0, 1] = I[..., 1, 0] = Ixy
         I[..., 0, 2] = I[..., 2, 0] = Ixz
         I[..., 1, 2] = I[..., 2, 1] = Iyz

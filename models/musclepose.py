@@ -3,10 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 
-from ..physics.anthropometrics import anthropometrics_from_beta_E
-from ..physics.inverse_dynamics_autograd import inverse_dynamics_autograd
-from ..physics.grfm import grfm_from_kinematics
-from ..physics.mtg import mtg_torque
+from MusclePose.physics.anthropometrics import anthropometrics_from_beta_E
+from MusclePose.physics.inverse_dynamics_autograd import inverse_dynamics_autograd
+from MusclePose.physics.grfm import grfm_from_kinematics
+from MusclePose.physics.mtg import mtg_torque
 
 @dataclass
 class ForwardOut:
@@ -20,6 +20,68 @@ class ForwardOut:
     alpha: torch.Tensor
     tau_q: torch.Tensor
     tau_mtg: torch.Tensor
+    phi: torch.Tensor = None
+
+
+class PhysicsBridge(nn.Module):
+    """Encodes actual physics outputs and fuses with encoder features
+    before projecting into the LLM embedding space.
+
+    Inputs consumed:
+      phi      (B, T, 256)   encoder hidden states
+      q        (B, T, 47)    joint angles
+      qdot     (B, T, 47)    joint velocities
+      tau_q    (B, T, 47)    inverse-dynamics torques
+      tau_mtg  (B, T, 41)    muscle-model torques
+      alpha    (B, T, 82)    muscle activations (flex + ext)
+      contact  (B, T, 2)     foot contact
+
+    Output:
+      soft_tokens (B, n_tokens, llm_dim)  ready to prepend to LLM input
+    """
+
+    PHYSICS_DIM = 47 + 47 + 47 + 41 + 82 + 2  # 266
+
+    def __init__(self, d_model=256, llm_dim=3072, n_tokens=8):
+        super().__init__()
+        self.n_tokens = n_tokens
+
+        self.physics_proj = nn.Sequential(
+            nn.Linear(self.PHYSICS_DIM, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        self.fuse = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+        )
+
+        self.pool = nn.AdaptiveAvgPool1d(n_tokens)
+
+        self.to_llm = nn.Sequential(
+            nn.Linear(d_model, llm_dim),
+            nn.GELU(),
+            nn.Linear(llm_dim, llm_dim),
+        )
+
+    def forward(self, out: 'ForwardOut') -> torch.Tensor:
+        physics_vec = torch.cat([
+            out.q,
+            out.qdot,
+            out.tau_q,
+            out.tau_mtg,
+            out.alpha,
+            out.contact,
+        ], dim=-1)
+
+        p = self.physics_proj(physics_vec)
+        fused = self.fuse(torch.cat([out.phi, p], dim=-1))
+
+        h = fused.transpose(1, 2)
+        h = self.pool(h)
+        h = h.transpose(1, 2)
+        return self.to_llm(h)
 
 def finite_differences(x: torch.Tensor, dt: float):
     xdot = torch.zeros_like(x)
@@ -110,11 +172,10 @@ class MusclePoseCOCO(nn.Module):
         foot_geom = torch.tensor([0.25,0.10,0.05], device=tokens.device, dtype=tokens.dtype)[None,None,:].repeat(B,2,1)
 
         # Build Psi for each foot: (B,T,2,8) placeholder features from q
-        # In your paper Psi uses ankle vertical kinematics + plantar/dorsi angle.
+        # In the paper Psi uses ankle vertical kinematics + plantar/dorsi angle.
         # Here we derive a simple proxy from q states.
         Psi = torch.zeros((B,T,2,8), device=tokens.device, dtype=tokens.dtype)
         Psi[...,0] = 1.0
-        # crude: use root y, root ydot, root yddot
         Psi[...,1] = q[...,1:2].repeat(1,1,2)
         Psi[...,3] = qdot[...,1:2].repeat(1,1,2)
         Psi[...,4] = qddot[...,1:2].repeat(1,1,2)
@@ -151,5 +212,5 @@ class MusclePoseCOCO(nn.Module):
         return ForwardOut(
             q=q, qdot=qdot, qddot=qddot,
             contact=contact, E=E, delta=delta, Z=Z, alpha=alpha,
-            tau_q=idout.tau_q, tau_mtg=tau_mtg
+            tau_q=idout.tau_q, tau_mtg=tau_mtg, phi=phi
         )

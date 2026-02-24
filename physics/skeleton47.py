@@ -1,7 +1,7 @@
 import torch
 from dataclasses import dataclass
 from typing import List, Tuple
-from ..utils.rot import euler_ZXY_to_matrix
+from MusclePose.utils.rot import euler_ZXY_to_matrix
 
 @dataclass
 class Skeleton47:
@@ -115,30 +115,37 @@ def unpack_q_to_local_angles(q: torch.Tensor, skel: Skeleton47) -> Tuple[torch.T
 
 def forward_kinematics(q: torch.Tensor, skel: Skeleton47):
     """
+    Functional (no in-place ops) FK for jacrev compatibility.
     Returns:
       R0k: (...,18,3,3)
       p_joint: (...,18,3)
       p_com: (...,18,3)
     """
     root_pos, angles = unpack_q_to_local_angles(q, skel)
-    R0k = torch.zeros(*q.shape[:-1], 18, 3, 3, device=q.device, dtype=q.dtype)
-    p_joint = torch.zeros(*q.shape[:-1], 18, 3, device=q.device, dtype=q.dtype)
-    p_com = torch.zeros_like(p_joint)
 
-    # root
-    R0k[..., 0, :, :] = euler_ZXY_to_matrix(angles[..., 0, :])
-    p_joint[..., 0, :] = root_pos
-    p_com[..., 0, :] = root_pos + (R0k[..., 0] @ skel.r_jc[0].view(3,1)).squeeze(-1)
+    R_list = []
+    p_list = []
+    c_list = []
+
+    R0 = euler_ZXY_to_matrix(angles[..., 0, :])
+    p0 = root_pos
+    c0 = root_pos + (R0 @ skel.r_jc[0].view(3, 1)).squeeze(-1)
+    R_list.append(R0)
+    p_list.append(p0)
+    c_list.append(c0)
 
     for k in range(1, 18):
-        p = skel.parent[k]
+        par = skel.parent[k]
         R_local = euler_ZXY_to_matrix(angles[..., k, :])
-        R0k[..., k] = R0k[..., p] @ R_local
+        Rk = R_list[par] @ R_local
+        offset = (R_list[par] @ skel.r_pj[k].view(3, 1)).squeeze(-1)
+        pk = p_list[par] + offset
+        ck = pk + (Rk @ skel.r_jc[k].view(3, 1)).squeeze(-1)
+        R_list.append(Rk)
+        p_list.append(pk)
+        c_list.append(ck)
 
-        offset = (R0k[..., p] @ skel.r_pj[k].view(3,1)).squeeze(-1)
-        p_joint[..., k] = p_joint[..., p] + offset
-
-        com_off = (R0k[..., k] @ skel.r_jc[k].view(3,1)).squeeze(-1)
-        p_com[..., k] = p_joint[..., k] + com_off
-
+    R0k = torch.stack(R_list, dim=-3)
+    p_joint = torch.stack(p_list, dim=-2)
+    p_com = torch.stack(c_list, dim=-2)
     return R0k, p_joint, p_com
