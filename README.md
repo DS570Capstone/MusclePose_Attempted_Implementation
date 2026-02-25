@@ -101,7 +101,7 @@ python -m MusclePose.tests.test_pipeline
 ```bash
 cd /scratch/jnolas77/fitness
 python -m MusclePose.train \
-  --data_dir MusclePose/data/Test-Data \
+  --data_dir MusclePose/data/Data \
   --epochs 15 \
   --batch_size 2 \
   --seq_len 60 \
