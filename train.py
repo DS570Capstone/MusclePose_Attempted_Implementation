@@ -6,8 +6,8 @@ End-to-end pipeline:
     -> transpose to (T,C) tokens -> MusclePose (physics) -> PhysicsBridge -> LLM coaching
 
 Each JSON clip contains:
-  trajectory, legs_trajectory, shoulder_trajectory, back_trajectory,
-  knee_angle_trajectory, arm_Trajectory, core_            (7 x N_FRAMES floats)
+  trajectory, legs_trajectory, bar_path_trajectory, arm_trajectory,
+  shoulder_symmetry, arm_Trajectory, core_               (7 x N_FRAMES floats)
   wave_features   (quality, energy, damping, frequency, harmonic, waves)
   LANGUAGE         (ground-truth coaching text)
   exercise, expert, fps, n_frames, error_rate, video_id   (metadata)
@@ -70,7 +70,19 @@ def parse_args():
 
 # ── Losses ──────────────────────────────────────────────────────────────
 def torque_loss(out: ForwardOut):
-    return (out.tau_q[..., 6:] - out.tau_mtg).pow(2).mean()
+    """Smooth-L1 on log-scaled torques to handle magnitude mismatch between
+    inverse-dynamics tau_q (can be ~10^4) and muscle-model tau_mtg (~10^1).
+
+    tau_q is DETACHED: inverse dynamics is a pseudo-label / teacher signal.
+    Gradients flow only through tau_mtg (-> alpha, MTG params).
+    Backprop through jacrev-based inverse dynamics produces NaN gradients.
+    """
+    tau_id = out.tau_q[..., 6:].detach()   # teacher — no grad
+    tau_m = out.tau_mtg
+    # sign-preserving log-scale: sign(x) * log(1 + |x|)
+    def log_scale(x):
+        return x.sign() * torch.log1p(x.abs())
+    return nn.functional.smooth_l1_loss(log_scale(tau_m), log_scale(tau_id))
 
 
 def smoothness_loss(q):
@@ -90,7 +102,7 @@ def activation_loss(out: ForwardOut):
 # ── LLM helpers ─────────────────────────────────────────────────────────
 def load_llm_with_lora(model_name, lora_r, lora_alpha, device):
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from peft import LoraConfig, get_peft_model
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
@@ -99,7 +111,6 @@ def load_llm_with_lora(model_name, lora_r, lora_alpha, device):
     llm = AutoModelForCausalLM.from_pretrained(
         model_name, device_map="auto", torch_dtype=torch.bfloat16, attn_implementation="eager",
     )
-    llm = prepare_model_for_kbit_training(llm)
 
     lora_cfg = LoraConfig(
         r=lora_r, lora_alpha=lora_alpha, lora_dropout=0.05,
@@ -129,10 +140,29 @@ def build_clip_prompts(batch_wave_features, batch_exercises, batch_languages):
 def compute_lm_loss(llm, tokenizer, bridge, phys_out, prompts, coaching_texts, device, max_len=256):
     """Forward through bridge + LLM, return language modelling loss.
 
-    prompts:        list[str]  per-sample prompts built from wave_features
-    coaching_texts: list[str]  ground-truth LANGUAGE from the JSON
+    ALL physics outputs including phi are DETACHED.  The encoder is trained
+    exclusively by physics losses; the bridge learns to read its (frozen w.r.t.
+    LM loss) representations and project them for the LLM.
+
+    Loss is computed in float32 to prevent bfloat16 cross-entropy instability
+    (softmax over 32 K vocab in bf16 can underflow → NaN).
+    Padding tokens in targets are masked with -100.
     """
-    soft_tokens = bridge(phys_out)                      # (B, n_tokens, llm_dim)
+    # Detach ALL physics outputs — encoder trained only by physics loss
+    detached_out = ForwardOut(
+        q=phys_out.q.detach(),
+        qdot=phys_out.qdot.detach(),
+        qddot=phys_out.qddot.detach(),
+        contact=phys_out.contact.detach(),
+        E=phys_out.E.detach(),
+        delta=phys_out.delta.detach(),
+        Z=phys_out.Z.detach(),
+        alpha=phys_out.alpha.detach(),
+        tau_q=phys_out.tau_q.detach(),
+        tau_mtg=phys_out.tau_mtg.detach(),
+        phi=phys_out.phi.detach(),
+    )
+    soft_tokens = bridge(detached_out)                  # (B, n_tokens, llm_dim)
     B = soft_tokens.shape[0]
 
     prompt_enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
@@ -145,16 +175,30 @@ def compute_lm_loss(llm, tokenizer, bridge, phys_out, prompts, coaching_texts, d
     combined_embeds = torch.cat([soft_tokens.to(prompt_embeds.dtype), prompt_embeds, target_embeds], dim=1)
     n_prefix = soft_tokens.shape[1] + prompt_embeds.shape[1]
 
-    # labels: -100 for soft + prompt tokens, actual ids for target tokens
+    # labels: -100 for soft + prompt tokens, target ids for coaching text
     ignore = torch.full((B, n_prefix), -100, dtype=torch.long, device=device)
-    labels = torch.cat([ignore, target_enc["input_ids"]], dim=1)
+    target_labels = target_enc["input_ids"].clone()
+    # Mask padding tokens so loss ignores them
+    if tokenizer.pad_token_id is not None:
+        target_labels[target_labels == tokenizer.pad_token_id] = -100
+    labels = torch.cat([ignore, target_labels], dim=1)
 
     # attention mask
-    soft_mask = torch.ones(B, soft_tokens.shape[1], device=device)
+    soft_mask = torch.ones(B, soft_tokens.shape[1], device=device, dtype=prompt_enc["attention_mask"].dtype)
     attn_mask = torch.cat([soft_mask, prompt_enc["attention_mask"], target_enc["attention_mask"]], dim=1)
 
-    out = llm(inputs_embeds=combined_embeds, attention_mask=attn_mask, labels=labels)
-    return out.loss
+    # Forward LLM without internal loss computation
+    out = llm(inputs_embeds=combined_embeds, attention_mask=attn_mask)
+
+    # Cross-entropy in float32 for numerical stability
+    shift_logits = out.logits[..., :-1, :].float()      # bf16 → fp32
+    shift_labels = labels[..., 1:].contiguous()
+    loss = nn.functional.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1),
+        ignore_index=-100,
+    )
+    return loss
 
 
 # ── Collation ───────────────────────────────────────────────────────────
@@ -204,8 +248,25 @@ def train_one_epoch(model, bridge, llm, tokenizer, loader, opt_phys, opt_lm, ske
         )
         coaching_texts = batch["language"]                      # LANGUAGE = ground truth
 
-        L_lm = compute_lm_loss(llm, tokenizer, bridge, out, prompts, coaching_texts, device, args.max_text_len)
+        # LM warmup: skip LM for epoch 1 to let physics encoder stabilise
+        if epoch <= 1:
+            L_lm = torch.zeros(1, device=device)
+        else:
+            L_lm = compute_lm_loss(llm, tokenizer, bridge, out, prompts, coaching_texts, device, args.max_text_len)
+            # Guard: if LM loss is NaN/Inf, drop it for this step
+            if not torch.isfinite(L_lm):
+                print(f"  [{epoch}][{batch_idx+1}] LM loss is NaN/Inf -> skipping LM for this step")
+                L_lm = torch.zeros(1, device=device)
+
         loss = L_physics + args.w_lm * L_lm
+
+        # NaN guard: skip update if loss is NaN/Inf
+        if not torch.isfinite(loss):
+            print(f"  [{epoch}][{batch_idx+1}] WARNING: loss is {loss.item()}, skipping update  "
+                  f"(torque={L_torque.item():.4g}, smooth={L_smooth.item():.4g}, lm={L_lm.item():.4g})")
+            opt_phys.zero_grad()
+            opt_lm.zero_grad()
+            continue
 
         opt_phys.zero_grad()
         opt_lm.zero_grad()
@@ -250,6 +311,8 @@ def validate(model, bridge, llm, tokenizer, loader, skel, args):
             batch["wave_features"], batch["exercise"], batch["language"]
         )
         L_lm = compute_lm_loss(llm, tokenizer, bridge, out, prompts, batch["language"], device, args.max_text_len)
+        if not torch.isfinite(L_lm):
+            L_lm = torch.zeros(1, device=device)
 
         val = args.w_torque * L_torque + args.w_lm * L_lm
         total += val.item()
@@ -294,6 +357,7 @@ def main():
 
     opt_phys = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_phys, T_max=args.epochs, eta_min=1e-6)
+    scheduler_lm = torch.optim.lr_scheduler.CosineAnnealingLR(opt_lm, T_max=args.epochs, eta_min=1e-6)
 
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
@@ -301,6 +365,7 @@ def main():
         train_stats = train_one_epoch(model, bridge, llm, tokenizer, train_loader, opt_phys, opt_lm, skel, args, epoch)
         val_loss = validate(model, bridge, llm, tokenizer, val_loader, skel, args)
         scheduler.step()
+        scheduler_lm.step()
         elapsed = time.time() - t0
 
         print(f"Epoch {epoch:3d}  train={train_stats['total']:.4f}  val={val_loss:.4f}  "

@@ -1,16 +1,26 @@
 """
 Bridge between MusclePose physics pipeline and Wave-LLM.
 
-Flow:
+Flow (Learned Cross-Attention Bridge with Temporal Event Tokens):
+
   clip JSON  ->  ClipDataset  ->  trajectories (C, T)
                                      |
-                           PhysicsSummary (joint angles, torques, etc.)
+                           MusclePose encoder  ->  phi (B, T, 256)
+                           + physics heads     ->  q, qdot, tau_q, tau_mtg, alpha, contact
                                      |
-                           WaveEncoder  ->  wave embeddings
-                                     |
-                           WaveToTextBridge  ->  LLM soft tokens
+                           PhysicsBridge (cross-attention):
+                             1. physics_proj: raw 266-d physics -> d_model
+                             2. fuse: [phi | physics_proj] -> d_model
+                             3. temporal_pe: sinusoidal positional encoding
+                             4. event_tokens: learned queries (n_tokens, d_model)
+                             5. cross-attention layers: event_tokens x fused context
+                             6. to_llm: d_model -> llm_dim soft tokens
                                      |
                            LLM generates coaching text
+
+The temporal event tokens are *learned* queries that specialise via
+cross-attention on different temporal phases of the exercise
+(eccentric/concentric reps, transitions, peak force, etc.).
 """
 
 import json
@@ -89,13 +99,26 @@ def extract_physics_summary(clip_dict: Dict) -> PhysicsSummary:
 def build_llm_prompt(summary: PhysicsSummary, language_hint: str = "") -> str:
     system = (
         "You are a biomechanics-aware fitness coach. "
-        "Given the physics analysis of an exercise clip, provide specific coaching feedback."
+        "Given the physics analysis of an exercise clip (including temporal event "
+        "tokens capturing rep phases, transitions, and peak-force moments), "
+        "provide specific coaching feedback."
     )
     user_block = summary.to_prompt()
+
+    # Temporal event context derived from wave phases
+    if summary.wave_phases:
+        event_lines = []
+        for i, w in enumerate(summary.wave_phases[:8]):
+            event_lines.append(
+                f"  Event {i+1}: {w['type']} "
+                f"(dur={w['duration_sec']:.2f}s, vel={w['mean_velocity']:.2f})"
+            )
+        user_block += "\nTemporal Events:\n" + "\n".join(event_lines)
+
     if language_hint:
         user_block += f"\n\nPrior analysis: {language_hint[:500]}"
     user_block += "\n\nProvide coaching feedback:"
-    return f"<|system|>\n{system}\n<|user|>\n{user_block}\n<|assistant|>\n"
+    return f"<|system|>\n{system}<|end|>\n<|user|>\n{user_block}<|end|>\n<|assistant|>\n"
 
 
 def clip_to_prompt(clip_path: str) -> str:

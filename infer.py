@@ -4,8 +4,8 @@ Unified MusclePose + LLM Inference
 Clip JSON -> trajectory waves -> MusclePose (physics) -> PhysicsBridge -> LLM coaching text
 
 Reads the same JSON format used for training:
-  trajectory, legs_trajectory, shoulder_trajectory, back_trajectory,
-  knee_angle_trajectory, arm_Trajectory, core_  (7 x N_FRAMES floats)
+  trajectory, legs_trajectory, bar_path_trajectory, arm_trajectory,
+  shoulder_symmetry, arm_Trajectory, core_      (7 x N_FRAMES floats)
   wave_features, LANGUAGE, exercise, fps, n_frames, ...
 """
 
@@ -177,17 +177,20 @@ def main():
     with torch.no_grad():
         soft_tokens = bridge(out).to(torch.bfloat16)
 
-    # build text prompt from the clip's actual wave_features
+    # build text prompt from the clip's actual wave_features (no ground-truth language at inference)
     summary = extract_physics_summary(raw)
-    prompt_text = build_llm_prompt(summary, raw.get("LANGUAGE", ""))
-    prompt_enc = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=128).to(device)
+    prompt_text = build_llm_prompt(summary, language_hint="")
+    prompt_enc = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=256).to(device)
     prompt_embeds = llm.get_input_embeddings()(prompt_enc["input_ids"])
 
     # combine: [soft_physics_tokens | prompt_text_tokens]
     combined = torch.cat([soft_tokens, prompt_embeds], dim=1)
     attn_mask = torch.ones(1, combined.shape[1], device=device)
 
-    # generate
+    # generate — use <|end|> (32007) as stop token, not <|endoftext|> (32000)
+    end_token_id = tokenizer.encode("<|end|>", add_special_tokens=False)
+    end_token_id = end_token_id[0] if end_token_id else tokenizer.eos_token_id
+
     print("\n--- Generating coaching feedback ---\n")
     with torch.no_grad():
         gen_ids = llm.generate(
@@ -197,9 +200,9 @@ def main():
             temperature=args.temperature,
             top_p=0.9,
             do_sample=True,
-            repetition_penalty=1.3,
+            repetition_penalty=1.1,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            eos_token_id=end_token_id,
         )
     response = tokenizer.decode(gen_ids[0], skip_special_tokens=True).strip()
     print(response)

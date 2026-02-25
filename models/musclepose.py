@@ -23,11 +23,83 @@ class ForwardOut:
     phi: torch.Tensor = None
 
 
-class PhysicsBridge(nn.Module):
-    """Encodes actual physics outputs and fuses with encoder features
-    before projecting into the LLM embedding space.
+class SinusoidalPositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for temporal awareness."""
 
-    Inputs consumed:
+    def __init__(self, d_model: int, max_len: int = 2048):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float32)
+            * (-torch.log(torch.tensor(10000.0)) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, D) -> (B, T, D) with positional encoding added."""
+        return x + self.pe[:, :x.size(1)]
+
+
+class CrossAttentionLayer(nn.Module):
+    """Single cross-attention layer: queries attend to key/value context.
+
+    query  (B, N, D)  -- learned event tokens
+    context(B, T, D)  -- fused physics sequence
+    output (B, N, D)
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=n_heads,
+            dropout=dropout, batch_first=True,
+        )
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_ctx = nn.LayerNorm(d_model)
+        self.norm_ff = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, query: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        # pre-norm cross-attention
+        q = self.norm_q(query)
+        ctx = self.norm_ctx(context)
+        attn_out, _ = self.cross_attn(q, ctx, ctx)
+        query = query + attn_out
+        # feed-forward with residual
+        query = query + self.ff(self.norm_ff(query))
+        return query
+
+
+class PhysicsBridge(nn.Module):
+    """Learned Cross-Attention Bridge with Temporal Event Tokens.
+
+    Instead of naively average-pooling the fused physics sequence,
+    this module uses *learned temporal event tokens* as cross-attention
+    queries that attend to the full time-resolved physics context.
+    Each event token can specialise on a different temporal aspect
+    (rep phases, transitions, peak-force moments, etc.), producing
+    richer soft tokens for the downstream LLM.
+
+    Architecture:
+      1. physics_proj:  project raw physics vector (266-d) -> d_model
+      2. fuse:          concatenate encoder hidden states + physics proj,
+                        then project back to d_model
+      3. temporal_pe:   sinusoidal positional encoding added to fused seq
+      4. event_tokens:  learned queries  (n_tokens, d_model)
+      5. cross_attn:    N layers of multi-head cross-attention
+                        query = event_tokens,  key/value = fused sequence
+      6. to_llm:        project d_model -> llm_dim
+
+    Inputs consumed (from ForwardOut):
       phi      (B, T, 256)   encoder hidden states
       q        (B, T, 47)    joint angles
       qdot     (B, T, 47)    joint velocities
@@ -42,30 +114,67 @@ class PhysicsBridge(nn.Module):
 
     PHYSICS_DIM = 47 + 47 + 47 + 41 + 82 + 2  # 266
 
-    def __init__(self, d_model=256, llm_dim=3072, n_tokens=8):
+    def __init__(
+        self,
+        d_model: int = 256,
+        llm_dim: int = 3072,
+        n_tokens: int = 8,
+        n_cross_layers: int = 2,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        max_seq_len: int = 2048,
+    ):
         super().__init__()
         self.n_tokens = n_tokens
 
+        # ---- physics projection ----
         self.physics_proj = nn.Sequential(
             nn.Linear(self.PHYSICS_DIM, d_model),
             nn.GELU(),
+            nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
         )
 
+        # ---- encoder + physics fusion ----
         self.fuse = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.GELU(),
+            nn.LayerNorm(d_model),
         )
 
-        self.pool = nn.AdaptiveAvgPool1d(n_tokens)
+        # ---- temporal positional encoding ----
+        self.temporal_pe = SinusoidalPositionalEncoding(d_model, max_len=max_seq_len)
 
+        # ---- learned temporal event tokens (queries) ----
+        self.event_tokens = nn.Parameter(
+            torch.randn(1, n_tokens, d_model) * 0.02
+        )
+
+        # ---- cross-attention layers ----
+        self.cross_layers = nn.ModuleList([
+            CrossAttentionLayer(d_model, n_heads=n_heads, dropout=dropout)
+            for _ in range(n_cross_layers)
+        ])
+
+        # ---- final layer-norm before LLM projection ----
+        self.out_norm = nn.LayerNorm(d_model)
+
+        # ---- project to LLM embedding space ----
         self.to_llm = nn.Sequential(
             nn.Linear(d_model, llm_dim),
             nn.GELU(),
             nn.Linear(llm_dim, llm_dim),
         )
 
+        # ---- output normalisation: match LLM embedding scale ----
+        # LLM text embeddings typically have std ≈ 0.03.  The learned gate
+        # starts at 0.0 (Tanh → 0) so that at init the soft tokens are silent,
+        # then gradually opens during training.
+        self.out_ln = nn.LayerNorm(llm_dim)
+        self.out_gate = nn.Parameter(torch.tensor(0.5))   # scalar gate, init=0.5 for nonzero soft tokens at start
+
     def forward(self, out: 'ForwardOut') -> torch.Tensor:
+        # ---- build physics vector (B, T, 266) ----
         physics_vec = torch.cat([
             out.q,
             out.qdot,
@@ -75,13 +184,26 @@ class PhysicsBridge(nn.Module):
             out.contact,
         ], dim=-1)
 
-        p = self.physics_proj(physics_vec)
-        fused = self.fuse(torch.cat([out.phi, p], dim=-1))
+        # ---- project & fuse ----
+        p = self.physics_proj(physics_vec)                       # (B, T, d_model)
+        fused = self.fuse(torch.cat([out.phi, p], dim=-1))       # (B, T, d_model)
 
-        h = fused.transpose(1, 2)
-        h = self.pool(h)
-        h = h.transpose(1, 2)
-        return self.to_llm(h)
+        # ---- add temporal positional encoding ----
+        context = self.temporal_pe(fused)                        # (B, T, d_model)
+
+        # ---- expand learned event tokens per batch ----
+        B = context.size(0)
+        queries = self.event_tokens.expand(B, -1, -1)           # (B, n_tokens, d_model)
+
+        # ---- cross-attention: event tokens attend to context ----
+        for layer in self.cross_layers:
+            queries = layer(queries, context)                    # (B, n_tokens, d_model)
+
+        # ---- project to LLM space with scale gating ----
+        raw = self.to_llm(self.out_norm(queries))                # (B, n_tokens, llm_dim)
+        normed = self.out_ln(raw)                                # layer-norm to ~unit var
+        gate = torch.tanh(self.out_gate)                         # in [-1, 1], starts at 0
+        return normed * gate * 0.03                              # scale to match LLM embed std
 
 def finite_differences(x: torch.Tensor, dt: float):
     xdot = torch.zeros_like(x)
@@ -187,7 +309,8 @@ class MusclePoseCOCO(nn.Module):
         # pack foot wrenches for ID: (B,T,2,6)
         foot_wrenches = torch.cat([grfm.F, grfm.M], dim=-1)
 
-        # Inverse dynamics τ_q
+        # Inverse dynamics τ_q  —  tau_q is detached in the loss function,
+        # so no gradients flow back through this (jacrev-based) computation.
         idout = inverse_dynamics_autograd(q, qdot, qddot, anth.mk, anth.I0k, foot_wrenches=foot_wrenches)
 
         # MTG torques τ_mtg for 41 rotational DoFs (q[6:])
