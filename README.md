@@ -86,7 +86,7 @@ Clip JSON (7 trajectory signals × N frames)
 ```bash
 module load cuda-12.9.0-gcc-12.1.0
 module load mamba/latest
-mamba activate wave_llm     # or your environment with torch, transformers, peft
+mamba activate wave_llm     # on ASU SOL HPC
 ```
 
 ### Run Tests
